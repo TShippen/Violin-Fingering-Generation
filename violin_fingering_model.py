@@ -6,7 +6,7 @@ from sklearn.metrics import precision_recall_fscore_support
 import tensorflow as tf
 import pretty_midi
 import time
-from tensorflow.contrib.rnn import LSTMCell, LSTMBlockCell
+from tensorflow import LSTMBlockCell
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -68,63 +68,57 @@ class violin_fingering_model(object):
                 )
                 grouped_data = []
                 current_group = []
-                current_start = None
+                current_end_time = 0
+
                 for row in data:
-                    if current_start is None or row["start"] == current_start:
+                    start_time = row["start"]
+                    end_time = start_time + row["duration"]
+
+                    if not current_group or start_time < current_end_time:
                         current_group.append(row)
+                        current_end_time = max(current_end_time, end_time)
                     else:
                         grouped_data.append(current_group)
                         current_group = [row]
-                    current_start = row["start"]
+                        current_end_time = end_time
+
                 if current_group:
                     grouped_data.append(current_group)
+
                 corpus[file] = grouped_data
         return corpus
 
     def segment_corpus(self, corpus, context_window=5):
-        def _segment_sequence(sequence, max_len, context_window):
-            n_pad = (
-                max_len - (len(sequence) % max_len)
-                if len(sequence) % max_len > 0
-                else 0
-            )
-            dt = sequence.dtype
-            paddings = np.array(
-                [
-                    (self.pitch_for_invalid_note, -1, 0, 0, 0, 0, 0)
-                    for _ in range(n_pad)
-                ],
-                dtype=dt,
-            )
-            sequence_padded = np.concatenate((sequence, paddings))
+        def _segment_sequence(sequence, context_measures):
+            # Calculate the number of measures in the sequence
+            num_measures = int(np.ceil(sequence[-1][-1]["start"] / 4))  # Assuming 4/4 time signature
 
-            # Pad the sequence at the beginning and end to handle context window
-            padding = np.array(
-                [(self.pitch_for_invalid_note, -1, 0, 0, 0, 0, 0)] * context_window,
-                dtype=dt,
-            )
-            padded_sequence = np.concatenate((padding, sequence_padded, padding))
+            # Pad the sequence with empty measures at the beginning and end to handle context measures
+            padding_start = [[] for _ in range(context_measures)]
+            padding_end = [[] for _ in range(num_measures + context_measures - len(sequence))]
+            padded_sequence = padding_start + sequence + padding_end
 
-            # Create segments with wider context
             segments = []
             valid_lens = []
-            for i in range(
-                context_window, len(padded_sequence) - context_window, max_len
-            ):
-                segment = padded_sequence[
-                    i - context_window : i + max_len + context_window
-                ]
+            for i in range(context_measures, len(padded_sequence) - context_measures):
+                segment_measures = padded_sequence[i - context_measures : i + context_measures + 1]
+                segment = [note for measure in segment_measures for note in measure]
                 segments.append(segment)
-                valid_lens.append(max_len)
+                valid_lens.append(len(padded_sequence[i]))
 
-            return np.array(segments), np.array(valid_lens)
+            # Pad the segments to a fixed length
+            max_segment_len = max(len(segment) for segment in segments)
+            padded_segments = [
+                segment + [(self.pitch_for_invalid_note, -1, 0, 0, 0, 0, 0)] * (max_segment_len - len(segment))
+                for segment in segments
+            ]
+
+            return np.array(padded_segments), np.array(valid_lens)
 
         corpus_seg = {}  # {key: {segments: 3d_array, lens: len_list}}
         for key, sequence in corpus.items():
             corpus_seg[key] = {}
-            segments, valid_lens = _segment_sequence(
-                sequence, max_len=self.n_steps, context_window=context_window
-            )
+            segments, valid_lens = self._segment_sequence(sequence, context_measures)
             corpus_seg[key]["segments"] = segments
             corpus_seg[key]["lens"] = valid_lens
 
@@ -225,7 +219,7 @@ class violin_fingering_model(object):
             outputs = gamma * normalized + beta
         return outputs
 
-    def BLSTM(self, x_p, x_s, x_d, x_b, x_len, dropout, activation=tf.nn.tanh):
+    def BLSTM(self, x_p, x_s, x_d, x_b, x_len, dropout, activation='tanh'):
         """p=pitch, s=start, d=duration, b=beat_type"""
         with tf.name_scope("Input_embedding"):
             x_p_onehot = tf.one_hot(x_p - self.lowest_pitch, depth=self.n_p_classes)
@@ -1343,30 +1337,30 @@ if __name__ == "__main__":
     model = model = violin_fingering_model()
     model.train()
 
-    # # Inference
-    # pitches = [55, 57, 59, 60, 62, 64, 66, 67] # G scale
-    # n_events = len(pitches)
-    # starts = [i * 1 for i in range(n_events)]
-    # durations = [1 for _ in range(n_events)]
-    # beat_types = [3 for _ in range(n_events)] # {'': 0, '1th': 1, '2th': 2, '4th': 3, '8th': 4, '16th': 5, '32th': 6}
-    # strings = [0 for _ in range(n_events)]
-    # positions = [0 for _ in range(n_events)]
-    # fingers = [0 for _ in range(n_events)]
-    #
-    # model = violin_fingering_model()
-    # pred_str, pred_pos, pred_fin = model.inference(pitches=pitches,
-    #                                                starts=starts,
-    #                                                durations=durations,
-    #                                                beat_types=beat_types,
-    #                                                strings=strings,
-    #                                                positions=positions,
-    #                                                fingers=fingers,
-    #                                                mode='basic') # valid mode = {'basic', 'lowest', 'nearest'}
-    #
-    # # Print the estimations
-    # string_classes = ['N', 'G', 'D', 'A', 'E']
-    # n_notes = len(pitches)
-    # print('pitch'.ljust(9), ''.join([pretty_midi.note_number_to_name(number).rjust(4) for number in pitches]))
-    # print('string'.ljust(9), ''.join([string_classes[s].rjust(4) for s in pred_str[0, :n_notes]]))
-    # print('position'.ljust(9), ''.join([str(p).rjust(4) for p in pred_pos[0, :n_notes]]))
-    # print('finger'.ljust(9), ''.join([str(f).rjust(4) for f in pred_fin[0, :n_notes]]))
+    # Inference
+    pitches = [55, 57, 59, 60, 62, 64, 66, 67] # G scale
+    n_events = len(pitches)
+    starts = [i * 1 for i in range(n_events)]
+    durations = [1 for _ in range(n_events)]
+    beat_types = [3 for _ in range(n_events)] # {'': 0, '1th': 1, '2th': 2, '4th': 3, '8th': 4, '16th': 5, '32th': 6}
+    strings = [0 for _ in range(n_events)]
+    positions = [0 for _ in range(n_events)]
+    fingers = [0 for _ in range(n_events)]
+    
+    model = violin_fingering_model()
+    pred_str, pred_pos, pred_fin = model.inference(pitches=pitches,
+                                                   starts=starts,
+                                                   durations=durations,
+                                                   beat_types=beat_types,
+                                                   strings=strings,
+                                                   positions=positions,
+                                                   fingers=fingers,
+                                                   mode='basic') # valid mode = {'basic', 'lowest', 'nearest'}
+    
+    # Print the estimations
+    string_classes = ['N', 'G', 'D', 'A', 'E']
+    n_notes = len(pitches)
+    print('pitch'.ljust(9), ''.join([pretty_midi.note_number_to_name(number).rjust(4) for number in pitches]))
+    print('string'.ljust(9), ''.join([string_classes[s].rjust(4) for s in pred_str[0, :n_notes]]))
+    print('position'.ljust(9), ''.join([str(p).rjust(4) for p in pred_pos[0, :n_notes]]))
+    print('finger'.ljust(9), ''.join([str(f).rjust(4) for f in pred_fin[0, :n_notes]]))
